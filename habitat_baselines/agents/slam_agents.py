@@ -4,8 +4,6 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-# type: ignore
-
 import argparse
 import os
 import random
@@ -18,7 +16,7 @@ import orbslam2
 import PIL
 import requests
 import torch
-from torch.nn import functional as F
+import torch.nn.functional as F
 
 import habitat
 from habitat.config.default import get_config
@@ -76,9 +74,9 @@ def make_good_config_for_orbslam2(config):
     config.SIMULATOR.RGB_SENSOR.HEIGHT = 256
     config.SIMULATOR.DEPTH_SENSOR.WIDTH = 256
     config.SIMULATOR.DEPTH_SENSOR.HEIGHT = 256
-    config.TRAINER.ORBSLAM2.CAMERA_HEIGHT = (
-        config.SIMULATOR.DEPTH_SENSOR.POSITION[1]
-    )
+    config.TRAINER.ORBSLAM2.CAMERA_HEIGHT = config.SIMULATOR.DEPTH_SENSOR.POSITION[
+        1
+    ]
     config.TRAINER.ORBSLAM2.H_OBSTACLE_MIN = (
         0.3 * config.TRAINER.ORBSLAM2.CAMERA_HEIGHT
     )
@@ -129,7 +127,7 @@ class RandomAgent(object):
 
 class BlindAgent(RandomAgent):
     def __init__(self, config):
-        super(BlindAgent, self).__init__(config)
+        super(BlindAgent, self).__init__()
         self.pos_th = config.DIST_TO_STOP
         self.angle_th = config.ANGLE_TH
         self.reset()
@@ -171,8 +169,7 @@ class BlindAgent(RandomAgent):
 
 
 class ORBSLAM2Agent(RandomAgent):
-    def __init__(self, config, device=torch.device("cuda:0")):  # noqa: B008
-        super(ORBSLAM2Agent, self).__init__(config)
+    def __init__(self, config, device=torch.device("cuda:0")):
         self.num_actions = config.NUM_ACTIONS
         self.dist_threshold_to_stop = config.DIST_TO_STOP
         self.slam_vocab_path = config.SLAM_VOCAB_PATH
@@ -497,7 +494,7 @@ class ORBSLAM2Agent(RandomAgent):
         pos_th = self.pos_th
         if get_distance(p_init, p_next) <= pos_th:
             return command
-        d_angle = norm_ang(
+        d_angle = angle_to_pi_2_minus_pi_2(
             get_direction(p_init, p_next, ang_th=d_angle_rot_th, pos_th=pos_th)
         )
         if abs(d_angle) < d_angle_rot_th:
@@ -530,10 +527,9 @@ class ORBSLAM2MonodepthAgent(ORBSLAM2Agent):
     def __init__(
         self,
         config,
-        device=torch.device("cuda:0"),  # noqa: B008
+        device=torch.device("cuda:0"),
         monocheckpoint="habitat_baselines/slambased/data/mp3d_resnet50.pth",
     ):
-        super(ORBSLAM2MonodepthAgent, self).__init__(config)
         self.num_actions = config.NUM_ACTIONS
         self.dist_threshold_to_stop = config.DIST_TO_STOP
         self.slam_vocab_path = config.SLAM_VOCAB_PATH
@@ -576,8 +572,8 @@ class ORBSLAM2MonodepthAgent(ORBSLAM2Agent):
         self.checkpoint = monocheckpoint
         if not os.path.isfile(self.checkpoint):
             mp3d_url = "http://cmp.felk.cvut.cz/~mishkdmy/navigation/mp3d_ft_monodepth_resnet50.pth"
-            # suncg_me_url = "http://cmp.felk.cvut.cz/~mishkdmy/navigation/suncg_me_resnet.pth"
-            # suncg_mf_url = "http://cmp.felk.cvut.cz/~mishkdmy/navigation/suncg_mf_resnet.pth"
+            suncg_me_url = "http://cmp.felk.cvut.cz/~mishkdmy/navigation/suncg_me_resnet.pth"
+            suncg_mf_url = "http://cmp.felk.cvut.cz/~mishkdmy/navigation/suncg_mf_resnet.pth"
             url = mp3d_url
             print("No monodepth checkpoint found. Downloading...", url)
             download(url, self.checkpoint)

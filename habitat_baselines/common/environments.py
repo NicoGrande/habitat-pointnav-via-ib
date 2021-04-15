@@ -13,6 +13,7 @@ in habitat. Customized environments should be registered using
 from typing import Optional, Type
 
 import habitat
+import numpy as np
 from habitat import Config, Dataset
 from habitat_baselines.common.baseline_registry import baseline_registry
 
@@ -68,7 +69,7 @@ class NavRLEnv(habitat.RLEnv):
         self._previous_measure = current_measure
 
         if self._episode_success():
-            reward += self._rl_config.SUCCESS_REWARD
+            reward += self._rl_config.SUCCESS_REWARD * np.exp((self._core_env_config.TASK.SUCCESS_DISTANCE - self._env.get_metrics()['distance_to_goal']) / self._core_env_config.TASK.SUCCESS_DISTANCE)
 
         return reward
 

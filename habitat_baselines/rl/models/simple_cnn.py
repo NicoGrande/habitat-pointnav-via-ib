@@ -1,8 +1,9 @@
-from typing import Dict
-
 import numpy as np
 import torch
-from torch import nn as nn
+import torch.nn as nn
+from gym.spaces import Box
+
+from habitat_baselines.common.utils import Flatten, ResizeCenterCropper
 
 
 class SimpleCNN(nn.Module):
@@ -19,8 +20,15 @@ class SimpleCNN(nn.Module):
         self,
         observation_space,
         output_size,
+        obs_transform: nn.Module = ResizeCenterCropper(size=(256, 256)),
     ):
         super().__init__()
+
+        self.obs_transform = obs_transform
+        if self.obs_transform is not None:
+            observation_space = obs_transform.transform_observation_space(
+                observation_space
+            )
 
         if "rgb" in observation_space.spaces:
             self._n_input_rgb = observation_space.spaces["rgb"].shape[2]
@@ -83,7 +91,7 @@ class SimpleCNN(nn.Module):
                     stride=self._cnn_layers_stride[2],
                 ),
                 #  nn.ReLU(True),
-                nn.Flatten(),
+                Flatten(),
                 nn.Linear(32 * cnn_dims[0] * cnn_dims[1], output_size),
                 nn.ReLU(True),
             )
@@ -120,7 +128,7 @@ class SimpleCNN(nn.Module):
         return tuple(out_dimension)
 
     def layer_init(self):
-        for layer in self.cnn:  # type: ignore
+        for layer in self.cnn:
             if isinstance(layer, (nn.Conv2d, nn.Linear)):
                 nn.init.kaiming_normal_(
                     layer.weight, nn.init.calculate_gain("relu")
@@ -132,15 +140,13 @@ class SimpleCNN(nn.Module):
     def is_blind(self):
         return self._n_input_rgb + self._n_input_depth == 0
 
-    def forward(self, observations: Dict[str, torch.Tensor]):
+    def forward(self, observations):
         cnn_input = []
         if self._n_input_rgb > 0:
             rgb_observations = observations["rgb"]
             # permute tensor to dimension [BATCH x CHANNEL x HEIGHT X WIDTH]
             rgb_observations = rgb_observations.permute(0, 3, 1, 2)
-            rgb_observations = (
-                rgb_observations.float() / 255.0
-            )  # normalize RGB
+            rgb_observations = rgb_observations / 255.0  # normalize RGB
             cnn_input.append(rgb_observations)
 
         if self._n_input_depth > 0:
@@ -149,6 +155,9 @@ class SimpleCNN(nn.Module):
             depth_observations = depth_observations.permute(0, 3, 1, 2)
             cnn_input.append(depth_observations)
 
-        cnn_inputs = torch.cat(cnn_input, dim=1)
+        if self.obs_transform:
+            cnn_input = [self.obs_transform(inp) for inp in cnn_input]
 
-        return self.cnn(cnn_inputs)
+        cnn_input = torch.cat(cnn_input, dim=1)
+
+        return self.cnn(cnn_input)

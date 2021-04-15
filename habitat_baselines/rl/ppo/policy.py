@@ -5,85 +5,136 @@
 # LICENSE file in the root directory of this source tree.
 import abc
 
+import numpy as np
 import torch
-from gym import spaces
-from torch import nn as nn
+import torch.nn as nn
+import torch.nn.functional as F
 
-from habitat.config import Config
-from habitat.tasks.nav.nav import (
-    ImageGoalSensor,
-    IntegratedPointGoalGPSAndCompassSensor,
-    PointGoalSensor,
-)
-from habitat_baselines.common.baseline_registry import baseline_registry
-from habitat_baselines.rl.models.rnn_state_encoder import (
-    build_rnn_state_encoder,
-)
+from habitat_baselines.common.utils import CategoricalNet, Flatten
+from habitat_baselines.rl.aux_losses import AuxLosses
+from habitat_baselines.rl.models.rnn_state_encoder import RNNStateEncoder
 from habitat_baselines.rl.models.simple_cnn import SimpleCNN
-from habitat_baselines.utils.common import CategoricalNet
 
 
-class Policy(nn.Module, metaclass=abc.ABCMeta):
+class Policy(nn.Module):
     def __init__(self, net, dim_actions):
         super().__init__()
         self.net = net
         self.dim_actions = dim_actions
 
-        self.action_distribution = CategoricalNet(
-            self.net.output_size, self.dim_actions
-        )
+        self.supervise_stop = False
+
+        if self.supervise_stop:
+            self.non_stop_action_distribution = CategoricalNet(
+                self.net.output_size, self.dim_actions - 1
+            )
+
+            self.stop_action_distribution = CategoricalNet(self.net.output_size, 2)
+        else:
+            self.action_distribution = CategoricalNet(
+                self.net.output_size, self.dim_actions
+            )
+
         self.critic = CriticHead(self.net.output_size)
 
     def forward(self, *x):
         raise NotImplementedError
 
     def act(
-        self,
-        observations,
-        rnn_hidden_states,
-        prev_actions,
-        masks,
-        deterministic=False,
+        self, observations, prev_observations, rnn_hidden_states, prev_actions, masks, deterministic=False
     ):
         features, rnn_hidden_states = self.net(
-            observations, rnn_hidden_states, prev_actions, masks
+            observations, prev_observations, rnn_hidden_states, prev_actions, masks
         )
-        distribution = self.action_distribution(features)
+
         value = self.critic(features)
 
-        if deterministic:
-            action = distribution.mode()
-        else:
-            action = distribution.sample()
+        if self.supervise_stop:
 
-        action_log_probs = distribution.log_probs(action)
+            stop_distribution = self.stop_action_distribution(features)
+            non_stop_distribution = self.non_stop_action_distribution(features)
+            if deterministic:
+                stop = stop_distribution.mode()
+                non_stop = non_stop_distribution.mode()
+            else:
+                stop = stop_distribution.sample()
+                non_stop = non_stop_distribution.sample()
+
+            action = torch.where(stop == 1, torch.zeros_like(stop), non_stop + 1)
+            action_log_probs = torch.where(
+                action == 0,
+                stop_distribution.log_probs(torch.full_like(action, 1)),
+                stop_distribution.log_probs(torch.full_like(action, 0))
+                + non_stop_distribution.log_probs(
+                    torch.max(action - 1, torch.zeros_like(action))
+                ),
+            )
+        else:
+            action_distribution = self.action_distribution(features)
+
+            if deterministic:
+                action = action_distribution.mode()
+            else:
+                action = action_distribution.sample()
+
+            action_log_probs = action_distribution.log_probs(action)
 
         return value, action, action_log_probs, rnn_hidden_states
 
-    def get_value(self, observations, rnn_hidden_states, prev_actions, masks):
-        features, _ = self.net(
-            observations, rnn_hidden_states, prev_actions, masks
-        )
+    def get_value(self, observations, prev_observations, rnn_hidden_states, prev_actions, masks):
+        features, _ = self.net(observations, prev_observations, rnn_hidden_states, prev_actions, masks)
         return self.critic(features)
 
     def evaluate_actions(
-        self, observations, rnn_hidden_states, prev_actions, masks, action
+        self, observations, prev_observations, rnn_hidden_states, prev_actions, masks, action
     ):
-        features, rnn_hidden_states = self.net(
-            observations, rnn_hidden_states, prev_actions, masks
-        )
-        distribution = self.action_distribution(features)
+        features, _ = self.net(observations, prev_observations, rnn_hidden_states, prev_actions, masks)
         value = self.critic(features)
 
-        action_log_probs = distribution.log_probs(action)
-        distribution_entropy = distribution.entropy()
+        if self.supervise_stop:
+            stop_distribution = self.stop_action_distribution(features)
+            non_stop_distribution = self.non_stop_action_distribution(features)
 
-        return value, action_log_probs, distribution_entropy, rnn_hidden_states
+            action_log_probs = torch.where(
+                action == 0,
+                stop_distribution.log_probs(torch.full_like(action, 1)),
+                stop_distribution.log_probs(torch.full_like(action, 0))
+                + non_stop_distribution.log_probs(
+                    torch.max(action - 1, torch.zeros_like(action))
+                ),
+            )
 
-    @classmethod
-    @abc.abstractmethod
-    def from_config(cls, config, observation_space, action_space):
-        pass
+            distribution_entropy = (
+                -1.0
+                * (
+                    stop_distribution.probs[:, -1] * stop_distribution.logits[:, -1]
+                    + (
+                        stop_distribution.probs[:, 0:1]
+                        * non_stop_distribution.probs
+                        * (
+                            stop_distribution.logits[:, 0:1]
+                            + non_stop_distribution.logits
+                        )
+                    ).sum(-1)
+                ).mean()
+            )
+
+            stop_loss = F.cross_entropy(
+                stop_distribution.logits,
+                observations["stop_oracle"].long().squeeze(-1),
+                weight=torch.tensor(
+                    [1.0, 1.0 / np.sqrt(100.0)], device=features.device
+                ),
+            )
+
+            AuxLosses.register_loss("stop_loss", stop_loss)
+        else:
+            action_distribution = self.action_distribution(features)
+
+            action_log_probs = action_distribution.log_probs(action)
+            distribution_entropy = action_distribution.entropy().mean()
+
+        return value, action_log_probs, distribution_entropy
 
 
 class CriticHead(nn.Module):
@@ -97,32 +148,17 @@ class CriticHead(nn.Module):
         return self.fc(x)
 
 
-@baseline_registry.register_policy
 class PointNavBaselinePolicy(Policy):
     def __init__(
-        self,
-        observation_space: spaces.Dict,
-        action_space,
-        hidden_size: int = 512,
-        **kwargs
+        self, observation_space, action_space, goal_sensor_uuid, hidden_size=512
     ):
         super().__init__(
-            PointNavBaselineNet(  # type: ignore
+            PointNavBaselineNet(
                 observation_space=observation_space,
                 hidden_size=hidden_size,
-                **kwargs,
+                goal_sensor_uuid=goal_sensor_uuid,
             ),
             action_space.n,
-        )
-
-    @classmethod
-    def from_config(
-        cls, config: Config, observation_space: spaces.Dict, action_space
-    ):
-        return cls(
-            observation_space=observation_space,
-            action_space=action_space,
-            hidden_size=config.RL.PPO.hidden_size,
         )
 
 
@@ -152,38 +188,15 @@ class PointNavBaselineNet(Net):
     goal vector with CNN's output and passes that through RNN.
     """
 
-    def __init__(
-        self,
-        observation_space: spaces.Dict,
-        hidden_size: int,
-    ):
+    def __init__(self, observation_space, hidden_size, goal_sensor_uuid):
         super().__init__()
-
-        if (
-            IntegratedPointGoalGPSAndCompassSensor.cls_uuid
-            in observation_space.spaces
-        ):
-            self._n_input_goal = observation_space.spaces[
-                IntegratedPointGoalGPSAndCompassSensor.cls_uuid
-            ].shape[0]
-        elif PointGoalSensor.cls_uuid in observation_space.spaces:
-            self._n_input_goal = observation_space.spaces[
-                PointGoalSensor.cls_uuid
-            ].shape[0]
-        elif ImageGoalSensor.cls_uuid in observation_space.spaces:
-            goal_observation_space = spaces.Dict(
-                {"rgb": observation_space.spaces[ImageGoalSensor.cls_uuid]}
-            )
-            self.goal_visual_encoder = SimpleCNN(
-                goal_observation_space, hidden_size
-            )
-            self._n_input_goal = hidden_size
-
+        self.goal_sensor_uuid = goal_sensor_uuid
+        self._n_input_goal = observation_space.spaces[self.goal_sensor_uuid].shape[0]
         self._hidden_size = hidden_size
 
         self.visual_encoder = SimpleCNN(observation_space, hidden_size)
 
-        self.state_encoder = build_rnn_state_encoder(
+        self.state_encoder = RNNStateEncoder(
             (0 if self.is_blind else self._hidden_size) + self._n_input_goal,
             self._hidden_size,
         )
@@ -202,27 +215,18 @@ class PointNavBaselineNet(Net):
     def num_recurrent_layers(self):
         return self.state_encoder.num_recurrent_layers
 
+    def get_target_encoding(self, observations):
+        return observations[self.goal_sensor_uuid]
+
     def forward(self, observations, rnn_hidden_states, prev_actions, masks):
-        if IntegratedPointGoalGPSAndCompassSensor.cls_uuid in observations:
-            target_encoding = observations[
-                IntegratedPointGoalGPSAndCompassSensor.cls_uuid
-            ]
-
-        elif PointGoalSensor.cls_uuid in observations:
-            target_encoding = observations[PointGoalSensor.cls_uuid]
-        elif ImageGoalSensor.cls_uuid in observations:
-            image_goal = observations[ImageGoalSensor.cls_uuid]
-            target_encoding = self.goal_visual_encoder({"rgb": image_goal})
-
+        target_encoding = self.get_target_encoding(observations)
         x = [target_encoding]
 
         if not self.is_blind:
             perception_embed = self.visual_encoder(observations)
             x = [perception_embed] + x
 
-        x_out = torch.cat(x, dim=1)
-        x_out, rnn_hidden_states = self.state_encoder(
-            x_out, rnn_hidden_states, masks
-        )
+        x = torch.cat(x, dim=1)
+        x, rnn_hidden_states = self.state_encoder(x, rnn_hidden_states, masks)
 
-        return x_out, rnn_hidden_states
+        return x, rnn_hidden_states

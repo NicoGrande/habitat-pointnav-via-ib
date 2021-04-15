@@ -4,16 +4,15 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Optional, Tuple
-
+import numpy as np
 import torch
-from torch import Tensor
-from torch import nn as nn
-from torch import optim as optim
+import torch.distributed as distrib
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 
-from habitat.utils import profiling_wrapper
-from habitat_baselines.common.rollout_storage import RolloutStorage
-from habitat_baselines.rl.ppo.policy import Policy
+from habitat_baselines.rl.aux_losses import AuxLosses
+from habitat_baselines.rl.ddppo.policy.running_mean_and_var import RunningMeanAndVar
 
 EPS_PPO = 1e-5
 
@@ -21,18 +20,19 @@ EPS_PPO = 1e-5
 class PPO(nn.Module):
     def __init__(
         self,
-        actor_critic: Policy,
-        clip_param: float,
-        ppo_epoch: int,
-        num_mini_batch: int,
-        value_loss_coef: float,
-        entropy_coef: float,
-        lr: Optional[float] = None,
-        eps: Optional[float] = None,
-        max_grad_norm: Optional[float] = None,
-        use_clipped_value_loss: bool = True,
-        use_normalized_advantage: bool = True,
-    ) -> None:
+        actor_critic,
+        clip_param,
+        ppo_epoch,
+        num_mini_batch,
+        value_loss_coef,
+        entropy_coef,
+        use_aux_losses,
+        lr=None,
+        eps=None,
+        max_grad_norm=None,
+        use_clipped_value_loss=True,
+        use_normalized_advantage=True,
+    ):
 
         super().__init__()
 
@@ -56,72 +56,83 @@ class PPO(nn.Module):
         self.device = next(actor_critic.parameters()).device
         self.use_normalized_advantage = use_normalized_advantage
 
+        self.reward_whitten = RunningMeanAndVar(shape=(1,))
+        self.reward_whitten.to(self.device)
+        self.use_aux_losses = use_aux_losses
+
     def forward(self, *x):
         raise NotImplementedError
 
-    def get_advantages(self, rollouts: RolloutStorage) -> Tensor:
-        advantages = (
-            rollouts.buffers["returns"][:-1]
-            - rollouts.buffers["value_preds"][:-1]
-        )
+    def get_advantages(self, rollouts):
+        advantages = rollouts.returns[:-1] - rollouts.value_preds[:-1]
         if not self.use_normalized_advantage:
             return advantages
 
         return (advantages - advantages.mean()) / (advantages.std() + EPS_PPO)
 
-    def update(self, rollouts: RolloutStorage) -> Tuple[float, float, float]:
+    def update(self, rollouts):
         advantages = self.get_advantages(rollouts)
 
-        value_loss_epoch = 0.0
-        action_loss_epoch = 0.0
-        dist_entropy_epoch = 0.0
+        value_loss_epoch = 0
+        action_loss_epoch = 0
+        aux_losses_epoch = 0
+        dist_entropy_epoch = 0
 
-        for _e in range(self.ppo_epoch):
-            profiling_wrapper.range_push("PPO.update epoch")
+        AuxLosses.activate()
+        for e in range(self.ppo_epoch):
             data_generator = rollouts.recurrent_generator(
                 advantages, self.num_mini_batch
             )
 
-            for batch in data_generator:
+            for sample in data_generator:
+                (
+                    obs_batch,
+                    prev_obs_batch,
+                    recurrent_hidden_states_batch,
+                    actions_batch,
+                    prev_actions_batch,
+                    value_preds_batch,
+                    return_batch,
+                    masks_batch,
+                    old_action_log_probs_batch,
+                    adv_targ,
+                ) = sample
+
+                AuxLosses.clear()
+                # Reshape to do in a single forward pass for all steps
+                self.reducer._rebuild_buckets()
                 (
                     values,
                     action_log_probs,
                     dist_entropy,
-                    _,
-                ) = self._evaluate_actions(
-                    batch["observations"],
-                    batch["recurrent_hidden_states"],
-                    batch["prev_actions"],
-                    batch["masks"],
-                    batch["actions"],
+                ) = self.actor_critic.evaluate_actions(
+                    obs_batch,
+                    prev_obs_batch,
+                    recurrent_hidden_states_batch,
+                    prev_actions_batch,
+                    masks_batch,
+                    actions_batch,
                 )
 
-                ratio = torch.exp(action_log_probs - batch["action_log_probs"])
-                surr1 = ratio * batch["advantages"]
+                ratio = torch.exp(action_log_probs - old_action_log_probs_batch)
+                surr1 = ratio * adv_targ
                 surr2 = (
-                    torch.clamp(
-                        ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-                    )
-                    * batch["advantages"]
+                    torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+                    * adv_targ
                 )
-                action_loss = -(torch.min(surr1, surr2).mean())
+                action_loss = -torch.min(surr1, surr2).mean()
 
                 if self.use_clipped_value_loss:
-                    value_pred_clipped = batch["value_preds"] + (
-                        values - batch["value_preds"]
+                    value_pred_clipped = value_preds_batch + (
+                        values - value_preds_batch
                     ).clamp(-self.clip_param, self.clip_param)
-                    value_losses = (values - batch["returns"]).pow(2)
-                    value_losses_clipped = (
-                        value_pred_clipped - batch["returns"]
-                    ).pow(2)
-                    value_loss = 0.5 * torch.max(
-                        value_losses, value_losses_clipped
+                    value_losses = (values - return_batch).pow(2)
+                    value_losses_clipped = (value_pred_clipped - return_batch).pow(2)
+                    value_loss = (
+                        0.5 * torch.max(value_losses, value_losses_clipped).mean()
                     )
                 else:
-                    value_loss = 0.5 * (batch["returns"] - values).pow(2)
-
-                value_loss = value_loss.mean()
-                dist_entropy = dist_entropy.mean()
+                    value_loss = 0.5 * (return_batch - values).pow(2).mean()
 
                 self.optimizer.zero_grad()
                 total_loss = (
@@ -129,6 +140,17 @@ class PPO(nn.Module):
                     + action_loss
                     - dist_entropy * self.entropy_coef
                 )
+
+                use_aux_loss = self.use_aux_losses
+
+                if use_aux_loss:
+                    aux_losses = AuxLosses.reduce()
+                else:
+                    aux_losses = AuxLosses.get_loss("information") * AuxLosses._loss_alphas["information"]
+
+                aux_losses_epoch += aux_losses.item()
+
+                total_loss = total_loss + aux_losses
 
                 self.before_backward(total_loss)
                 total_loss.backward()
@@ -142,36 +164,30 @@ class PPO(nn.Module):
                 action_loss_epoch += action_loss.item()
                 dist_entropy_epoch += dist_entropy.item()
 
-            profiling_wrapper.range_pop()  # PPO.update epoch
-
         num_updates = self.ppo_epoch * self.num_mini_batch
 
         value_loss_epoch /= num_updates
         action_loss_epoch /= num_updates
         dist_entropy_epoch /= num_updates
+        aux_losses_epoch /= num_updates
 
-        return value_loss_epoch, action_loss_epoch, dist_entropy_epoch
+        AuxLosses.deactivate()
 
-    def _evaluate_actions(
-        self, observations, rnn_hidden_states, prev_actions, masks, action
-    ):
-        r"""Internal method that calls Policy.evaluate_actions.  This is used instead of calling
-        that directly so that that call can be overrided with inheritence
-        """
-        return self.actor_critic.evaluate_actions(
-            observations, rnn_hidden_states, prev_actions, masks, action
+        return (
+            value_loss_epoch,
+            action_loss_epoch,
+            dist_entropy_epoch,
+            aux_losses_epoch,
         )
 
-    def before_backward(self, loss: Tensor) -> None:
+    def before_backward(self, loss):
         pass
 
-    def after_backward(self, loss: Tensor) -> None:
+    def after_backward(self, loss):
         pass
 
-    def before_step(self) -> None:
-        nn.utils.clip_grad_norm_(
-            self.actor_critic.parameters(), self.max_grad_norm
-        )
+    def before_step(self):
+        nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
 
-    def after_step(self) -> None:
+    def after_step(self):
         pass

@@ -1,0 +1,18 @@
+DATA:
+    DATASET: "gibson"
+    TYPE: "trajectory"
+  
+MODEL:
+    INPUT_MODALITY: "depth"
+    REPR_SIZE: 512
+  
+TASK:
+    NAME: "egomotion"
+    NUM_REGRESSION_TARGETS: 4
+  
+EGOMOTION_LOSS_WEIGHT: 1.0
+  
+MAX_EPOCHS: 30
+EVAL_EVERY: 500
+  
+ENV_NAME: "sensors=depth_task=egomotion_reprSize=512_bs=64"

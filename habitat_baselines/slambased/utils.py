@@ -29,8 +29,6 @@ def str2bool(v):
         return True
     elif v.lower() in ("no", "false", "f", "n", "0"):
         return False
-    else:
-        raise ValueError(f"{v} cannot be converted to a bool")
 
 
 def resize_pil(np_img, size=128):
