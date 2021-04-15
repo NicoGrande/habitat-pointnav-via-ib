@@ -3,7 +3,7 @@ Realisic PointGoal Navigation via Information Bottleneck
 
 ![alt text](res/img/model-figure.png?raw=true)
 
-Our code is builds on the [Habitat](https://github.com/facebookresearch/habitat-lab/) framework and thus only changes some files. Please refer to the original Habitat documentation for an overview of the framework as well as installation instructions. Furthermore, the environment configurations used in this work are as defined in the [Habitat Challenge 2020](https://github.com/facebookresearch/habitat-challenge). 
+Our code is builds on the [Habitat](https://github.com/facebookresearch/habitat-lab/) framework and thus only changes some files. Please refer to the original Habitat documentation for an overview of the framework as well as installation instructions. Furthermore, the task configurations used in this work are as defined in the [Habitat Challenge](https://github.com/facebookresearch/habitat-challenge). Specifically, we use the 2019 Habitat Challenge Setting without access to ground truth GPS+Compass and the 2020 Habitat Challenge Setting. 
 
 ## Requirements
 1. Python 3.6+
